@@ -1,0 +1,7 @@
+.devcontainer/
+.claude/
+.venv/
+*.MOV
+*.mov
+*.mp4
+.DS_Store
