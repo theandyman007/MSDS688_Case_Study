@@ -1,7 +1,7 @@
 """Shortcut for extract_frames.py.
 
 Usage (from project root):
-python scripts/auto_extraction.py                  # every video in data/videos
+python scripts/auto_extraction.py                  # every video in source/videos
 python scripts/auto_extraction.py --skip-existing  # resume after an interruption
 python scripts/auto_extraction.py my_video.mp4     # still works for a single video
 
@@ -24,7 +24,7 @@ FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v"}
 
 p = argparse.ArgumentParser(description="Extract sharpest frames from videos")
-p.add_argument("video", nargs="?", help="one video (name in data/videos, or full path). Omit to process ALL videos.")
+p.add_argument("video", nargs="?", help="one video (name in source/videos, or full path). Omit to process ALL videos.")
 p.add_argument("--n", type=int, default=200)
 p.add_argument("--max-side", type=int, default=1920)
 p.add_argument("--skip-existing", action="store_true", help="skip videos that already have a frames folder")
