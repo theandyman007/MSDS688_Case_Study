@@ -1,7 +1,7 @@
 .devcontainer/
 .claude/
 .venv/
-.source/
+source/
 *.MOV
 *.mov
 *.mp4
