@@ -7,3 +7,5 @@ source/
 *.mov
 *.mp4
 .DS_Store
+.venv-mac
+data/
