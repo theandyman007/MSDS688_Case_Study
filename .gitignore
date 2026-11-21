@@ -1,6 +1,7 @@
 __pycache__/
 .devcontainer/
 .claude/
+CLAUDE.md
 .venv/
 source/
 *.MOV
