@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from gsplat import rasterization
 from gsplat.strategy import DefaultStrategy
+import lpips
 
 SH_C0 = 0.28209479177387814   # zeroth spherical-harmonic constant: rgb = 0.5 + SH_C0 * sh0
 
@@ -133,14 +134,15 @@ def make_optimizers(params, scene_scale):
 
 
 
-def save_checkpoint(path, step, params, optimizers, state, scheduler, config):
+def save_checkpoint(path, step, params, optimizers, state, scheduler, config, extra = None):
     tmp = path.with_suffix('.tmp')
     torch.save({'step': step,
                 'config': config,
                 'params': {k: v.detach() for k, v in params.items()},
                 'optimizers': {k: o.state_dict() for k, o in optimizers.items()},
                 'strategy_state': state,
-                'scheduler': scheduler.state_dict()}, tmp)
+                'scheduler': scheduler.state_dict(),
+                **(extra or {})}, tmp)
     tmp.replace(path)      # write then rename, so a crash mid-save can't corrupt the last checkpoint
     print(f"Checkpoint saved at step {step + 1} -> {path}")
 
@@ -179,6 +181,8 @@ def render(params, viewmat, K, width, height, sh_degree, bg):
         sh_degree = sh_degree,
         backgrounds = bg,
         packed = False,
+        absgrad = True,
+        rasterize_mode='antialiased',
     )
     return out[0], info                                 # [H, W, 3]
 
@@ -242,6 +246,13 @@ def fmt(seconds):
 
 
 
+def gpu_used_gb():
+    # Whole-GPU usage from the driver (includes PyTorch's cache, other processes, and the Windows display)
+    free, total = torch.cuda.mem_get_info()
+    return (total - free) / 1e9
+
+
+
 def tilt(viewmat, degrees):
     """
     Pitch a world -> camera matrix about the acmera's own x axis.  Negative = look up, positive = look down.
@@ -260,13 +271,16 @@ def evaluate(params, scene, viewmats, Ks, sh_degree, bg, out_dir, device):
     if len(scene['test_ids']) == 0:
         return
 
+    lpips_fn = lpips.LPIPS(net = 'alex', verbose = False).to(device)
+    to_nchw = lambda x: x.permute(2, 0, 1)[None] * 2 - 1     # [H, W, 3] in 0..1 -> [1, 3, H, W] in -1..1
+
     render_dir = out_dir / 'renders'
     render_dir.mkdir(exist_ok = True)
     tilt_dirs = {'up': -35, 'down': 35}
     for name in tilt_dirs:
         (out_dir / f'renders_{name}').mkdir(exist_ok = True)
 
-    psnrs, ssims = [], []
+    psnrs, ssims, lpipss = [], [], []
 
     with torch.no_grad():
         for i in scene['test_ids']:
@@ -276,16 +290,22 @@ def evaluate(params, scene, viewmats, Ks, sh_degree, bg, out_dir, device):
 
             psnrs.append((-10 * torch.log10(F.mse_loss(pred, gt))).item())
             ssims.append(ssim(pred, gt).item())
+            lpipss.append(lpips_fn(to_nchw(pred), to_nchw(gt)).item())
+
+            png_name = Path(scene['names'][i]).with_suffix('.png').name
 
             # Ground truth on the left, render on the right
             side = torch.cat([gt, pred], 1).mul(255).byte().cpu().numpy()
-            Image.fromarray(side).save(render_dir / Path(scene['names'][i]).with_suffix('.png').name)
+            Image.fromarray(side).save(render_dir / png_name)
+
+            # Tilted views have no ground truth, so these are for eyeballing only
             for name, deg in tilt_dirs.items():
                 img, _ = render(params, tilt(viewmats[i], deg), Ks[i], gt.shape[1], gt.shape[0], sh_degree, bg)
                 out = img.clamp(0, 1).mul(255).byte().cpu().numpy()
-                Image.fromarray(out).save(out_dir / f'renders_{name}' / Path(scene['names'][i]).with_suffix('.png').name)
+                Image.fromarray(out).save(out_dir / f'renders_{name}' / png_name)
 
-    msg = (f"Held-out views: {len(psnrs)}  PSNR {np.mean(psnrs):.2f} dB  SSIM {np.mean(ssims):.4f}")
+    msg = (f"Held-out views: {len(psnrs)}  PSNR {np.mean(psnrs):.2f} dB  "
+           f"SSIM {np.mean(ssims):.4f}  LPIPS {np.mean(lpipss):.4f}")
     print(msg)
     (out_dir / 'metrics.txt').write_text(msg + '\n')
 
@@ -319,17 +339,21 @@ def export(colmap_dir, out_dir, data_factor, sh_degree, test_every, white_bg):
 
 
 def train(colmap_dir, out_dir, steps = 30_000, data_factor = 2, sh_degree = 3,
-          ssim_lambda = 0.2, grow_grad2d = 0.0002, test_every = 8, white_bg = False, log_every = 500,
-          ckpt_every = 5000, resume = False):
+          ssim_lambda = 0.2, grow_grad2d = 0.0008, test_every = 8, white_bg = False, log_every = 500,
+          ckpt_every = 5000, resume = False, vram_soft = 6.5, vram_hard = 7.5,
+          aniso_weight = 0.0, aniso_max = 5.0, exposure_comp = False):
     if not torch.cuda.is_available():
         raise RuntimeError('gsplat needs a CUDA GPU (torch.cuda.is_available() is False)')
 
     device = 'cuda'
     torch.manual_seed(0)
+    np.random.seed(0)                                   # same training-image order every run, so runs are comparable
     colmap_dir, out_dir = Path(colmap_dir), Path(out_dir)
     out_dir.mkdir(parents = True, exist_ok = True)
     ckpt_path = out_dir / 'checkpoint.pt'
-    config = {'steps': steps, 'data_factor': data_factor, 'sh_degree': sh_degree, 'test_every': test_every, 'grow_grad2d': grow_grad2d}
+    config = {'steps': steps, 'data_factor': data_factor, 'sh_degree': sh_degree, 'test_every': test_every,
+              'grow_grad2d': grow_grad2d, 'aniso_weight': aniso_weight, 'aniso_max': aniso_max,
+              'exposure_comp': exposure_comp}
 
     scene = load_scene(colmap_dir, data_factor, test_every)
     viewmats = torch.tensor(scene['viewmats'], dtype = torch.float32, device = device)
@@ -338,7 +362,7 @@ def train(colmap_dir, out_dir, steps = 30_000, data_factor = 2, sh_degree = 3,
 
     # Clone/split Gaussians with large screen-space gradients, prune transparent/huge ones,
     # and reset opacity every 3000 steps; densification stops halfway through training
-    strategy = DefaultStrategy(grow_grad2d = grow_grad2d, refine_stop_iter = min(15_000, steps // 2), verbose = True)
+    strategy = DefaultStrategy(absgrad = True, grow_grad2d = grow_grad2d, refine_stop_iter = min(15_000, steps // 2), verbose = True)
 
     ckpt = None
     if resume and ckpt_path.exists():
@@ -354,6 +378,17 @@ def train(colmap_dir, out_dir, steps = 30_000, data_factor = 2, sh_degree = 3,
         start_step = 0
 
     strategy.check_sanity(params, optimizers)
+
+    # Per-image colour correction: rgb_out = M @ rgb + b, stored as a [3, 4] matrix per image.
+    # Starts at identity (no change). Only used during training; evaluation renders the raw splats.
+    n_img = len(scene['images'])
+    eye34 = torch.eye(3, 4, device = device)
+    color_aff = torch.nn.Parameter(eye34.repeat(n_img, 1, 1))
+    aff_opt = torch.optim.Adam([color_aff], lr = 5e-3)
+    if ckpt is not None and 'color_aff' in ckpt:
+        color_aff.data.copy_(ckpt['color_aff'].to(device))
+        aff_opt.load_state_dict(ckpt['aff_opt'])
+    extra = lambda: {'color_aff': color_aff.detach(), 'aff_opt': aff_opt.state_dict()}
 
     # Position learning rate decays 100x over training
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizers['means'], gamma = 0.01 ** (1 / steps))
@@ -382,17 +417,55 @@ def train(colmap_dir, out_dir, steps = 30_000, data_factor = 2, sh_degree = 3,
 
             # Add one spherical-harmonic band every 1000 steps (view-dependent colour)
             sh_now = min(step // 1000, sh_degree)
-            pred, info = render(params, viewmats[i], Ks[i], gt.shape[1], gt.shape[0], sh_now, bg)
+
+            # Random background each step, so half-transparent "fog" splats get penalized
+            pred, info = render(params, viewmats[i], Ks[i], gt.shape[1], gt.shape[0], sh_now,
+                                torch.rand(1, 3, device = device))
 
             strategy.step_pre_backward(params, optimizers, state, step, info)
 
-            l1 = (pred - gt).abs().mean()
-            loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - ssim(pred, gt))
+            # VRAM guard. Every 50 steps is plenty; the driver query costs a little
+            if step % 50 == 0:
+                used = gpu_used_gb()
+                if used > vram_hard:
+                    print(f"\nVRAM {used:.1f} GB > hard limit {vram_hard} GB - saving and stopping")
+                    stop['requested'] = True
+                elif used > vram_soft and step < strategy.refine_stop_iter:
+                    strategy.refine_stop_iter = step      # gsplat skips all densify/prune/reset from now on
+                    torch.cuda.empty_cache()
+                    print(f"\nVRAM {used:.1f} GB > soft limit {vram_soft} GB - densification frozen at "
+                          f"{len(params['means']):,} Gaussians, training continues")
+
+            if exposure_comp:
+                A = color_aff[i]
+                pred_c = pred @ A[:, :3].T + A[:, 3]        # per-pixel M @ rgb + b
+            else:
+                pred_c = pred
+
+            l1 = (pred_c - gt).abs().mean()
+            loss = (1 - ssim_lambda) * l1 + ssim_lambda * (1 - ssim(pred_c, gt))
+
+            # Keep the AVERAGE correction at identity. Otherwise all corrections could drift together
+            # (e.g. all 20% brighter) and the splats would drift the opposite way to compensate.
+            if exposure_comp:
+                loss = loss + 0.1 * (color_aff.mean(0) - eye34).pow(2).sum()
+
+            # Shape penalty: punish needles (longest axis >> middle axis), but leave flat discs alone
+            if aniso_weight > 0:
+                ls = params['scales'].sort(-1).values        # log scales per splat, ascending
+                needle = torch.exp(ls[:, 2] - ls[:, 1])      # longest / middle axis
+                loss = loss + aniso_weight * (needle - aniso_max).clamp_min(0).mean()
+
             loss.backward()
 
             for opt in optimizers.values():
                 opt.step()
                 opt.zero_grad(set_to_none = True)
+
+            if exposure_comp:
+                aff_opt.step()
+                aff_opt.zero_grad(set_to_none = True)
+
             scheduler.step()
 
             strategy.step_post_backward(params, optimizers, state, step, info, packed = False)
@@ -400,16 +473,20 @@ def train(colmap_dir, out_dir, steps = 30_000, data_factor = 2, sh_degree = 3,
             if (step + 1) % log_every == 0 or step == start_step:
                 elapsed = time.time() - t0
                 eta = elapsed / (step + 1 - start_step) * (steps - step - 1)
+                with torch.no_grad():
+                    ls = params['scales'].sort(-1).values
+                    needle_pct = (torch.exp(ls[:, 2] - ls[:, 1]) > aniso_max).float().mean().item() * 100
                 print(f"step {step + 1:>6}/{steps}  loss {loss.item():.4f}  "
                       f"gaussians {len(params['means']):>9,}  "
-                      f"vram {torch.cuda.max_memory_allocated() / 1e9:.1f} GB  "
+                      f"needles {needle_pct:4.1f}%  "
+                      f"vram {torch.cuda.max_memory_allocated() / 1e9:.1f} GB (gpu {gpu_used_gb():.1f})  "
                       f"elapsed {fmt(elapsed)}  eta {fmt(eta)}")
 
             if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
-                save_checkpoint(ckpt_path, step, params, optimizers, state, scheduler, config)
+                save_checkpoint(ckpt_path, step, params, optimizers, state, scheduler, config, extra())
 
             if stop['requested']:
-                save_checkpoint(ckpt_path, step, params, optimizers, state, scheduler, config)
+                save_checkpoint(ckpt_path, step, params, optimizers, state, scheduler, config, extra())
                 print(f"Stopped at step {step + 1}. Rerun with --resume to continue.")
                 break
 
@@ -423,10 +500,20 @@ def train(colmap_dir, out_dir, steps = 30_000, data_factor = 2, sh_degree = 3,
     print(f"Training session took {fmt(time.time() - t0)}")
     save_ply(params, out_dir / 'splats.ply')
 
+    if exposure_comp:
+        train_set = set(int(t) for t in train_ids)
+        with open(out_dir / 'exposure.csv', 'w') as f:
+            f.write('image,train,gain_r,gain_g,gain_b,bias_r,bias_g,bias_b\n')
+            for j, name in enumerate(scene['names']):
+                A = color_aff[j].detach().cpu()
+                vals = [*A.diagonal().tolist(), *A[:, 3].tolist()]
+                f.write(f"{name},{int(j in train_set)}," + ','.join(f'{v:.4f}' for v in vals) + '\n')
+
     if not stop['requested']:
         evaluate(params, scene, viewmats, Ks, sh_degree, bg, out_dir, device)
 
     return params
+        
 
 
 
@@ -440,7 +527,7 @@ if __name__ == "__main__":
                    help = 'downscale images by this factor (1 = full size, more VRAM and slower)')
     p.add_argument('--sh-degree', type = int, default = 3)
     p.add_argument('--ssim-lambda', type = float, default = 0.2)
-    p.add_argument('--grow-grad2d', type = float, default = 0.0002,
+    p.add_argument('--grow-grad2d', type = float, default = 0.0008,
                    help = 'densification threshold; higher = fewer Gaussians, less VRAM')
     p.add_argument('--test-every', type = int, default = 8,
                    help = 'hold out every Nth frame for PSNR/SSIM (0 = train on all)')
@@ -450,6 +537,20 @@ if __name__ == "__main__":
     p.add_argument('--resume', action = 'store_true', help = 'continue from <out>/checkpoint.pt')
     p.add_argument('--export-only', action = 'store_true',
                    help = 'no training: write splats.ply + metrics from <out>/checkpoint.pt')
+
+    p.add_argument('--vram-soft', type = float, default = 6.5,
+                   help = 'GB: stop densifying above this (training continues)')
+    p.add_argument('--vram-hard', type = float, default = 7.5,
+                   help = 'GB: save a checkpoint and stop above this')
+
+    p.add_argument('--aniso-weight', type = float, default = 0.0,
+                   help = 'needle-splat penalty weight (0 = off; try 0.01)')
+    p.add_argument('--aniso-max', type = float, default = 5.0,
+                   help = 'allowed longest/middle axis ratio before the penalty applies')
+
+    p.add_argument('--exposure-comp', action = 'store_true',
+                   help = 'learn a per-image colour correction during training (handles exposure drift)')
+    
     args = p.parse_args()
 
     out = args.out or f"data/splats/{Path(args.colmap_dir).name}"
@@ -457,6 +558,9 @@ if __name__ == "__main__":
         export(args.colmap_dir, out, args.data_factor, args.sh_degree, args.test_every, args.white_bg)
     else:
         train(args.colmap_dir, out, steps = args.steps, data_factor = args.data_factor,
-              sh_degree = args.sh_degree, ssim_lambda = args.ssim_lambda,
-              grow_grad2d = args.grow_grad2d, test_every = args.test_every,
-              white_bg = args.white_bg, ckpt_every = args.ckpt_every, resume = args.resume)
+                      sh_degree = args.sh_degree, ssim_lambda = args.ssim_lambda,
+                      grow_grad2d = args.grow_grad2d, test_every = args.test_every,
+                      white_bg = args.white_bg, ckpt_every = args.ckpt_every, resume = args.resume,
+                      vram_soft = args.vram_soft, vram_hard = args.vram_hard,
+                      aniso_weight = args.aniso_weight, aniso_max = args.aniso_max,
+                      exposure_comp = args.exposure_comp)

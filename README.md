@@ -110,3 +110,5 @@ Things to know
 - Check your Python version for open3d. As far as I know, open3d's prebuilt packages only go up to Python 3.12. Your .venv is 3.13 and .venv-mac is 3.14, so pip install open3d may fail on both. If it does, make a 3.12 virtual environment for this stage.
 - Expect a rough mesh from sparse points. The sparse cloud has only a few thousand points, so the mesh will be blobby. --source dense gives much better results but needs an NVIDIA GPU with a CUDA build of pycolmap, so it won't work on a Mac.
 - The pycolmap dense-stereo calls (patch_match_stereo and stereo_fusion) haven't been tested. I wrote them from my knowledge of pycolmap's API. If they error on your version, check the signatures in the docs.
+- Website to look at final splats.ply:
+    https://superspl.at/editor
