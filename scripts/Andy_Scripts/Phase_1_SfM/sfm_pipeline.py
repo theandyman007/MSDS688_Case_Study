@@ -17,6 +17,46 @@ from pathlib import Path
 
 import pycolmap
 
+import csv, json, time
+import numpy as np
+
+
+def _cam_center(im):
+    try:
+        return np.asarray(im.projection_center())
+    except AttributeError:
+        T = im.cam_from_world() if callable(im.cam_from_world) else im.cam_from_world
+        M = T.matrix()
+        return -M[:, :3].T @ M[:, 3]
+
+
+def export_metrics(rec, maps, names, out_dir, timings, settings):
+    """Write metrics.json and camera_path.csv for later visualization/comparison."""
+    out_dir = Path(out_dir)
+    reg = sorted(rec.images.values(), key=lambda im: im.name)
+    reg_names = [im.name for im in reg]
+
+    with open(out_dir / "camera_path.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["name", "x", "y", "z"])
+        for im in reg:
+            w.writerow([im.name, *_cam_center(im).tolist()])
+
+    metrics = {
+        "pycolmap": pycolmap.__version__,
+        "has_cuda": bool(getattr(pycolmap, "has_cuda", False)),
+        "settings": settings,
+        "timings_s": timings,
+        "n_models": len(maps),
+        "registered_per_model": {str(k): m.num_reg_images() for k, m in maps.items()},
+        "registered": rec.num_reg_images(),
+        "total": len(names),
+        "unregistered": sorted(set(names) - set(reg_names)),
+        "points3D": rec.num_points3D(),
+        "observations": rec.compute_num_observations(),
+        "mean_reproj_px": rec.compute_mean_reprojection_error(),
+        "cameras": [{"id": cid, "text": str(c)} for cid, c in rec.cameras.items()],
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
 def prepare_frames(src_dir, dst_dir, n_frames=None):
     """Copy the first n_frames *consecutive* frames (all if None) to dst_dir.
@@ -105,6 +145,30 @@ def save_outputs(rec, image_dir, out_dir, undistort=True):
         pycolmap.undistort_images(und, best_dir, image_dir)
 
 
+# def run_sfm(frames_src, work_dir, n_frames=None, camera_model="OPENCV",
+#             overlap=20, undistort=True):
+#     """Full Stage 1. Returns (reconstruction, summary string)."""
+#     work_dir = Path(work_dir)
+#     shutil.rmtree(work_dir, ignore_errors=True)   # COLMAP appends to old databases
+#     work_dir.mkdir(parents=True)
+
+#     image_dir = work_dir / "images"
+#     database_path = work_dir / "database.db"
+
+#     names = prepare_frames(frames_src, image_dir, n_frames)
+#     print(f"Using {len(names)} frames")
+
+#     extract(database_path, image_dir, camera_model)
+#     match(database_path, overlap)
+#     maps = map_incremental(database_path, image_dir, work_dir / "sparse")
+
+#     best_id, rec = pick_best(maps)
+#     text = summarize(maps, best_id, rec, names)
+#     print(text)
+#     (work_dir / "summary.txt").write_text(text + "\n\n" + rec.summary())
+
+#     save_outputs(rec, image_dir, work_dir, undistort)
+#     return rec, text
 def run_sfm(frames_src, work_dir, n_frames=None, camera_model="OPENCV",
             overlap=20, undistort=True):
     """Full Stage 1. Returns (reconstruction, summary string)."""
@@ -114,18 +178,28 @@ def run_sfm(frames_src, work_dir, n_frames=None, camera_model="OPENCV",
 
     image_dir = work_dir / "images"
     database_path = work_dir / "database.db"
+    timings = {}
 
     names = prepare_frames(frames_src, image_dir, n_frames)
     print(f"Using {len(names)} frames")
 
-    extract(database_path, image_dir, camera_model)
-    match(database_path, overlap)
-    maps = map_incremental(database_path, image_dir, work_dir / "sparse")
+    t = time.time(); extract(database_path, image_dir, camera_model)
+    timings["extract"] = time.time() - t
+    t = time.time(); match(database_path, overlap)
+    timings["match"] = time.time() - t
+    t = time.time(); maps = map_incremental(database_path, image_dir, work_dir / "sparse")
+    timings["mapping"] = time.time() - t
 
     best_id, rec = pick_best(maps)
     text = summarize(maps, best_id, rec, names)
     print(text)
     (work_dir / "summary.txt").write_text(text + "\n\n" + rec.summary())
 
-    save_outputs(rec, image_dir, work_dir, undistort)
+    t = time.time(); save_outputs(rec, image_dir, work_dir, undistort)
+    timings["save_undistort"] = time.time() - t
+    timings = {k: round(v, 1) for k, v in timings.items()}
+    print("timings (s):", timings)
+
+    export_metrics(rec, maps, names, work_dir, timings,
+                   {"n_frames": n_frames, "camera_model": camera_model, "overlap": overlap})
     return rec, text
