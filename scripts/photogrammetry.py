@@ -74,7 +74,7 @@ def estimate_normals(pcd, radius = None):
     if radius is None:
         radius = 2.0 * float(np.mean(pcd.compute_nearest_neighbor_distance()))
 
-    pcd.estimate_normals(o3d.gemetry.KDTreeSearchParamHybrid(radius = radius, max_nn = 30))
+    pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius = radius, max_nn = 30))
 
     # Poisson needs normals that agree on which side is "outside"
     pcd.orient_normals_consistent_tangent_plane(k = 15)
@@ -84,9 +84,9 @@ def estimate_normals(pcd, radius = None):
 
 
 def poisson_mesh(pcd, depth = 9, density_quantile = 0.05, crop = True):
-    mesh, densities = o3d.gemoetry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth = depth)
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth = depth)
 
-    # Poisson closes the surface everywhere, inflating a "ballon" far from real data
+    # Poisson closes the surface everywhere, inflating a "balloon" far from real data
     # Those faces have low density (few supporting points), so cut them off.
     densities = np.asarray(densities)
     if density_quantile > 0:
@@ -96,7 +96,7 @@ def poisson_mesh(pcd, depth = 9, density_quantile = 0.05, crop = True):
         mesh = mesh.crop(pcd.get_axis_aligned_bounding_box())
 
     mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_traingles()
+    mesh.remove_duplicated_triangles()
     mesh.remove_duplicated_vertices()
     mesh.remove_non_manifold_edges()
     mesh.compute_vertex_normals()
@@ -128,12 +128,12 @@ def run_photogrammetry(colmap_dir, out_dir, source = 'sparse', voxel = 0.0, nb_n
     # 4) Screened Poisson + trim
     mesh = poisson_mesh(pcd, depth, density_quantile, crop)
     if len(mesh.triangles) == 0:
-        raise RuntimeError('Poisson produced an empty mesh - try a lower --density-quanitle or --depth')
+        raise RuntimeError('Poisson produced an empty mesh - try a lower --density-quantile or --depth')
 
     # 5) Save outputs
     o3d.io.write_point_cloud(str(out_dir / 'cleaned_points.ply'), pcd)
-    o3d.io.write_traingle_mesh(str(out_dir / 'mesh.ply'), mesh)
-    o3d.io.write_traingle_mesh(str(out_dir / 'mesh.obj'), mesh)
+    o3d.io.write_triangle_mesh(str(out_dir / 'mesh.ply'), mesh)
+    o3d.io.write_triangle_mesh(str(out_dir / 'mesh.obj'), mesh)
 
     print(f"Mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles -> {out_dir}")
 
@@ -145,13 +145,13 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description = 'Stage 2A: Photogrammetry mesh with open3d')
     p.add_argument('colmap_dir', help = 'Stage 1 output folder, e.g. data/colmap/<scene>')
 
-    p.add_argument('--out', default = None, helpp = 'default: data/mesh/<scene name>')
+    p.add_argument('--out', default = None, help = 'default: data/mesh/<scene name>')
 
     p.add_argument('--source', choices = ['sparse', 'dense'], default = 'sparse')
 
     p.add_argument('--voxel', type = float, default = 0.0, help = 'voxel downsample size (0 = off)')
 
-    p.add_argument('--nb_neighbors', type = int, default = 20)
+    p.add_argument('--nb-neighbors', type = int, default = 20)
 
     p.add_argument('--std-ratio', type = float, default = 2.0)
 
@@ -171,4 +171,4 @@ if __name__ == "__main__":
                               args.std_ratio, args.depth, args.density_quantile, not args.no_crop)
 
     if args.view:
-        o3d.visulatization.draw_gemetries([mesh], mesh_show_back_face = True)
+        o3d.visualization.draw_geometries([mesh], mesh_show_back_face = True)

@@ -6,7 +6,8 @@ import pycolmap
 
 
 
-def run_sfm(image_dir, out_dir, matcher = 'sequential', overlap = 20, camera_model = 'OPENCV'):
+def run_sfm(image_dir, out_dir, matcher = 'sequential', overlap = 20, camera_model = 'OPENCV',
+            num_threads = 4, max_image_size = 1600):
     image_dir = Path(image_dir)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents = True, exist_ok = True)
@@ -14,7 +15,7 @@ def run_sfm(image_dir, out_dir, matcher = 'sequential', overlap = 20, camera_mod
     database_path = out_dir / "database.db"
     sparse_dir = out_dir / 'sparse'
 
-    # COLMAP appends to an existing database, so start clean ever run
+    # COLMAP appends to an existing database, so start clean every run
     if database_path.exists():
         database_path.unlink()
 
@@ -33,20 +34,27 @@ def run_sfm(image_dir, out_dir, matcher = 'sequential', overlap = 20, camera_mod
     # 1) SIFT keypoints - one shared camera (same phone/lens, AE/AF locked)
     reader_options = pycolmap.ImageReaderOptions()
     reader_options.camera_model = camera_model
+
+    # CPU SIFT uses a lot of RAM per thread (it upsamples each image 2x),
+    # so cap the threads and image size to avoid being killed for running out of memory
+    extraction_options = pycolmap.FeatureExtractionOptions()
+    extraction_options.num_threads = num_threads
+    extraction_options.max_image_size = max_image_size
+
     pycolmap.extract_features(
         database_path,
         image_dir,
         image_names = image_names,
         camera_mode = pycolmap.CameraMode.SINGLE,
-        reader_options = reader_options
+        reader_options = reader_options,
+        extraction_options = extraction_options
     )
 
     # 2) Matching
     if matcher == 'sequential':
         seq_options = pycolmap.SequentialPairingOptions()
         seq_options.overlap = overlap
-        pycolmap.match_sequential(database_path, pairing_options
-  = seq_options)
+        pycolmap.match_sequential(database_path, pairing_options = seq_options)
     else:
         pycolmap.match_exhaustive(database_path)
 
@@ -84,8 +92,12 @@ if __name__ == "__main__":
     p.add_argument('--matcher', choices = ['sequential', 'exhaustive'], default = 'sequential')
     p.add_argument('--overlap', type = int, default = 20)
     p.add_argument('--camera-model', default = 'OPENCV')
+    p.add_argument('--threads', type = int, default = 4,
+                   help = 'feature extraction threads (more = faster but more RAM)')
+    p.add_argument('--max-image-size', type = int, default = 1600,
+                   help = 'downscale long side to this for SIFT (-1 = full size)')
     args = p.parse_args()
 
     out = args.out or f"data/colmap/{Path(args.images).name}"
-    run_sfm(args.images, out, args.matcher, args.overlap, args.camera_model)
-
+    run_sfm(args.images, out, args.matcher, args.overlap, args.camera_model,
+            args.threads, args.max_image_size)
