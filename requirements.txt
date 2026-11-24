@@ -1,18 +1,16 @@
 # Stage 0: frame extraction
-  opencv-python
-  numpy
+opencv-python
+numpy
 
-  # Stage 1 / 2A / 2B: COLMAP structure-from-motion
-  pycolmap>=4.2.1
+# Stage 1 / 2A / 2B: COLMAP structure-from-motion (CUDA 12)
+pycolmap-cuda12>=4.2.1; sys_platform == "linux"
+pycolmap>=4.2.1; sys_platform != "linux"
 
-  # Stage 2A: photogrammetry meshing
-  # Note: open3d wheels may only be available up to Python 3.12
-  open3d
+# Stage 2A: photogrammetry meshing
+open3d
 
-  # Stage 2B: Gaussian splatting
-  # Install a CUDA build of torch first if you have an NVIDIA GPU:
-  #   https://pytorch.org/get-started/locally/
-  Pillow
-  torch
-  gsplat
-  lpips
+# Stage 2B: Gaussian splatting
+Pillow
+torch
+gsplat
+lpips
