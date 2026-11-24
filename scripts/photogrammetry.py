@@ -16,6 +16,10 @@ import open3d as o3d
 
 MIN_POINTS = 100
 
+# Output folders COLMAP's PatchMatch writes into but never creates itself.
+# undistort_images() creates them empty, and Google Drive / uploads / zips often drop empty folders.
+STEREO_SUBDIRS = ('depth_maps', 'normal_maps', 'consistency_graphs')
+
 
 def load_sparse(colmap_dir):
     ply = colmap_dir / 'sparse_points.ply'  # written by run_sfm.py
@@ -33,7 +37,9 @@ def load_dense(colmap_dir):
     """
     import pycolmap
 
+    colmap_dir = Path(colmap_dir).resolve()    # absolute path; COLMAP's worker threads are fragile with '../..'
     workspace = colmap_dir / 'undistorted'
+    stereo_dir = workspace / 'stereo'
     dense_ply = colmap_dir / 'dense_points.ply'
 
     # MVS is slow, so reuse a previous result if one exists
@@ -44,12 +50,20 @@ def load_dense(colmap_dir):
     if not workspace.exists():
         raise RuntimeError(f"{workspace} not found - run scripts/run_sfm.py first")
 
+    if not (stereo_dir / 'patch-match.cfg').exists():
+        raise RuntimeError(f"{stereo_dir / 'patch-match.cfg'} not found - the undistorted workspace is "
+                            f"incomplete; re-run scripts/run_sfm.py")
+
+    # Make sure the output folders exist, otherwise PatchMatch computes everything and then fails to save
+    for sub in STEREO_SUBDIRS:
+        (stereo_dir / sub).mkdir(parents = True, exist_ok = True)
+
     try:
-        pycolmap.patch_match_stereo(workspace)          # per-image depth maps
-        pycolmap.stereo_fusion(dense_ply, workspace)    # fuse depth maps -> one cloud
+        pycolmap.patch_match_stereo(str(workspace))                 # per-image depth maps
+        pycolmap.stereo_fusion(str(dense_ply), str(workspace))      # fuse depth maps -> one cloud
     except Exception as e:
         raise RuntimeError(f"Dense MVS failed ({e}). This needs a CUDA build of pycolmap; "
-                           f"use --source sparse instead.") from e
+                            f"use --source sparse instead.") from e
 
     return o3d.io.read_point_cloud(str(dense_ply))
 
@@ -63,7 +77,7 @@ def clean_points(pcd, voxel = 0.0, nb_neighbors = 20, std_ratio = 2.0):
     pcd, _ = pcd.remove_statistical_outlier(nb_neighbors = nb_neighbors, std_ratio = std_ratio)
 
     print(f"Outlier removal: kept {len(pcd.points)} / {before} points "
-          f"({before - len(pcd.points)} removed)")
+        f"({before - len(pcd.points)} removed)")
     return pcd
 
 
@@ -94,7 +108,6 @@ def poisson_mesh(pcd, depth = 9, density_quantile = 0.05, crop = True):
 
     if crop:
         mesh = mesh.crop(pcd.get_axis_aligned_bounding_box())
-
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
     mesh.remove_duplicated_vertices()
@@ -106,8 +119,8 @@ def poisson_mesh(pcd, depth = 9, density_quantile = 0.05, crop = True):
 
 
 def run_photogrammetry(colmap_dir, out_dir, source = 'sparse', voxel = 0.0, nb_neighbors = 20,
-                       std_ratio = 2.0, depth = 9, density_quantile = 0.05, crop = True):
-    colmap_dir = Path(colmap_dir)
+                        std_ratio = 2.0, depth = 9, density_quantile = 0.05, crop = True):
+    colmap_dir = Path(colmap_dir).resolve()
     out_dir = Path(out_dir)
     out_dir.mkdir(parents = True, exist_ok = True)
 
@@ -158,8 +171,9 @@ if __name__ == "__main__":
     p.add_argument('--depth', type = int, default = 9, help = 'Poisson octree depth (higher = more detail)')
 
     p.add_argument('--density-quantile', type = float, default = 0.05,
-                   help = 'trim this fraction of lowest-density vertices (0 = off)')
+                    help = 'trim this fraction of lowest-density vertices (0 = off)')
 
+    p.add_argument('--no-crop', action = 'store_true', help = "don't crop mesh to the point cloud's bounding box")
     p.add_argument('--no-crop', action = 'store_true', help = "don't crop mesh to the point cloud's bounding box")
 
     p.add_argument('--view', action = 'store_true', help = 'open a viewer when done')
@@ -168,7 +182,7 @@ if __name__ == "__main__":
 
     out = args.out or f"data/mesh/{Path(args.colmap_dir).name}"
     mesh = run_photogrammetry(args.colmap_dir, out, args.source, args.voxel, args.nb_neighbors,
-                              args.std_ratio, args.depth, args.density_quantile, not args.no_crop)
+                            args.std_ratio, args.depth, args.density_quantile, not args.no_crop)
 
     if args.view:
         o3d.visualization.draw_geometries([mesh], mesh_show_back_face = True)
